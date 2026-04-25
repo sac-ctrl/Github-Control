@@ -11,7 +11,7 @@ object BuildInfo {
     const val VERSION_CODE = 1
 
     /** owner/repo on github.com — used by the in-app updater + About links. */
-    const val GITHUB_OWNER = "ShaktiKumar-dev"
+    const val GITHUB_OWNER = "neet-ctrl"
     const val GITHUB_REPO  = "GitHub-Control"
     const val ISSUES_URL = "https://github.com/$GITHUB_OWNER/$GITHUB_REPO/issues/new"
     const val REPO_URL = "https://github.com/$GITHUB_OWNER/$GITHUB_REPO"
