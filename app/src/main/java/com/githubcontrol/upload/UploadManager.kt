@@ -447,12 +447,4 @@ class UploadManager @Inject constructor(
             // Always clean up local repo to free storage
             runCatching { jgit.cleanup(job.owner, job.repo) }
         }
-    } catch (t: Throwable) {
-        // Clean up on error
-        runCatching { jgit.cleanup(job.owner, job.repo) }
-        throw t
-    } finally {
-        // Always clean up local repo to free storage
-        runCatching { jgit.cleanup(job.owner, job.repo) }
     }
-}
