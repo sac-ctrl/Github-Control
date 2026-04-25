@@ -324,7 +324,6 @@ class UploadManager @Inject constructor(
         // Always use JGit for REPLACE_FOLDER to avoid API 422 errors
         runReplaceFolderWithJGit(job)
     }
-    }
 
     private suspend fun runReplaceFolderWithJGit(job: UploadJob) = withContext(Dispatchers.IO) {
         try {
