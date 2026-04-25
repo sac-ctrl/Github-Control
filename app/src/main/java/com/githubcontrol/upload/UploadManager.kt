@@ -448,3 +448,4 @@ class UploadManager @Inject constructor(
             runCatching { jgit.cleanup(job.owner, job.repo) }
         }
     }
+}
