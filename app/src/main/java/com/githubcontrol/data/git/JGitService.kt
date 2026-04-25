@@ -124,4 +124,12 @@ class JGitService @Inject constructor(
     suspend fun localBranches(owner: String, repo: String) = withContext(Dispatchers.IO) {
         Git.open(localPath(owner, repo)).use { g -> g.branchList().call().map { it.name } }
     }
+
+    /** Clean up local repository clone to free storage space */
+    suspend fun cleanup(owner: String, repo: String) = withContext(Dispatchers.IO) {
+        val dir = localPath(owner, repo)
+        if (dir.exists()) {
+            runCatching { dir.deleteRecursively() }
+        }
+    }
 }

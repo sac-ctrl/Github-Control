@@ -5,6 +5,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import com.githubcontrol.data.api.PutFileRequest
+import com.githubcontrol.data.git.JGitService
 import com.githubcontrol.data.repository.GitHubRepository
 import com.githubcontrol.notifications.Notifier
 import com.githubcontrol.utils.GitignoreMatcher
@@ -17,12 +18,17 @@ import kotlinx.coroutines.withContext
 import android.util.Base64
 import android.util.Base64OutputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.zip.ZipInputStream
 import javax.inject.Inject
 import javax.inject.Singleton
 
 enum class ConflictMode { OVERWRITE, SKIP, RENAME, REPLACE_FOLDER }
 enum class UploadFileState { PENDING, UPLOADING, DONE, SKIPPED, FAILED }
+
+const val LARGE_FILE_THRESHOLD = 20L * 1024 * 1024 // 20MB
 
 data class UploadFile(
     val id: String,
@@ -67,6 +73,7 @@ data class UploadProgress(
 class UploadManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val repo: GitHubRepository,
+    private val jgit: JGitService,
     private val notifier: Notifier
 ) {
     private val _state = MutableStateFlow(UploadProgress())
@@ -172,35 +179,62 @@ class UploadManager @Inject constructor(
                     _state.value = _state.value.copy(files = job.files.toList(), uploaded = done, bytesDone = bytesDone)
                     continue
                 }
-                if (job.conflictMode == ConflictMode.SKIP) {
-                    val exists = runCatching { repo.fileContent(job.owner, job.repo, uf.targetPath, job.branch) }.isSuccess
-                    if (exists) { uf.state = UploadFileState.SKIPPED; done++; continue }
-                }
-                val targetSha = if (job.conflictMode == ConflictMode.OVERWRITE) {
-                    runCatching { repo.fileContent(job.owner, job.repo, uf.targetPath, job.branch).sha }.getOrNull()
-                } else null
-                val finalPath = if (job.conflictMode == ConflictMode.RENAME) renameIfExists(job.owner, job.repo, uf.targetPath, job.branch) else uf.targetPath
 
-                val b64 = streamBase64(Uri.parse(uf.id)) ?: throw IllegalStateException("Cannot read")
-                val req = PutFileRequest(
-                    message = job.message,
-                    content = b64,
-                    sha = targetSha,
-                    branch = job.branch,
-                    author = if (job.authorName != null && job.authorEmail != null)
-                        com.githubcontrol.data.api.GhCommitAuthor(job.authorName, job.authorEmail, java.time.Instant.now().toString()) else null,
-                    committer = if (job.authorName != null && job.authorEmail != null)
-                        com.githubcontrol.data.api.GhCommitAuthor(job.authorName, job.authorEmail, java.time.Instant.now().toString()) else null,
-                )
-                repo.api.putFile(job.owner, job.repo, finalPath, req)
-                uf.state = UploadFileState.DONE
-                uf.bytesDone = uf.sizeBytes
-                bytesDone += uf.sizeBytes
-                Logger.i("Upload", "OK   $finalPath  ${uf.sizeBytes}B")
+                if (uf.sizeBytes >= LARGE_FILE_THRESHOLD) {
+                    // Use JGit for large files
+                    uploadWithJGit(job, uf)
+                    uf.state = UploadFileState.DONE
+                    uf.bytesDone = uf.sizeBytes
+                    bytesDone += uf.sizeBytes
+                    Logger.i("Upload", "OK   ${uf.targetPath}  ${uf.sizeBytes}B (JGit)")
+                } else {
+                    // Use API for small files
+                    if (job.conflictMode == ConflictMode.SKIP) {
+                        val exists = runCatching { repo.fileContent(job.owner, job.repo, uf.targetPath, job.branch) }.isSuccess
+                        if (exists) { uf.state = UploadFileState.SKIPPED; done++; continue }
+                    }
+                    val targetSha = if (job.conflictMode == ConflictMode.OVERWRITE) {
+                        runCatching { repo.fileContent(job.owner, job.repo, uf.targetPath, job.branch).sha }.getOrNull()
+                    } else null
+                    val finalPath = if (job.conflictMode == ConflictMode.RENAME) renameIfExists(job.owner, job.repo, uf.targetPath, job.branch) else uf.targetPath
+
+                    val b64 = streamBase64(Uri.parse(uf.id)) ?: throw IllegalStateException("Cannot read")
+                    val req = PutFileRequest(
+                        message = job.message,
+                        content = b64,
+                        sha = targetSha,
+                        branch = job.branch,
+                        author = if (job.authorName != null && job.authorEmail != null)
+                            com.githubcontrol.data.api.GhCommitAuthor(job.authorName, job.authorEmail, java.time.Instant.now().toString()) else null,
+                        committer = if (job.authorName != null && job.authorEmail != null)
+                            com.githubcontrol.data.api.GhCommitAuthor(job.authorName, job.authorEmail, java.time.Instant.now().toString()) else null,
+                    )
+                    repo.api.putFile(job.owner, job.repo, finalPath, req)
+                    uf.state = UploadFileState.DONE
+                    uf.bytesDone = uf.sizeBytes
+                    bytesDone += uf.sizeBytes
+                    Logger.i("Upload", "OK   $finalPath  ${uf.sizeBytes}B")
+                }
             } catch (t: Throwable) {
-                uf.state = UploadFileState.FAILED
-                uf.error = t.message
-                Logger.e("Upload", "FAIL ${uf.targetPath}", t)
+                if (t is OutOfMemoryError && uf.sizeBytes < LARGE_FILE_THRESHOLD) {
+                    // Retry with JGit on OOM for small files
+                    Logger.w("Upload", "OOM on ${uf.targetPath}, retrying with JGit")
+                    try {
+                        uploadWithJGit(job, uf)
+                        uf.state = UploadFileState.DONE
+                        uf.bytesDone = uf.sizeBytes
+                        bytesDone += uf.sizeBytes
+                        Logger.i("Upload", "OK   ${uf.targetPath}  ${uf.sizeBytes}B (JGit retry)")
+                    } catch (t2: Throwable) {
+                        uf.state = UploadFileState.FAILED
+                        uf.error = t2.message
+                        Logger.e("Upload", "FAIL ${uf.targetPath} (JGit retry)", t2)
+                    }
+                } else {
+                    uf.state = UploadFileState.FAILED
+                    uf.error = t.message
+                    Logger.e("Upload", "FAIL ${uf.targetPath}", t)
+                }
             }
             done++
             val elapsed = (System.currentTimeMillis() - start) / 1000.0
@@ -287,42 +321,138 @@ class UploadManager @Inject constructor(
      * new files in a single Git Data API commit.
      */
     private suspend fun runReplaceFolder(job: UploadJob) {
-        // 1. List existing files under the target folder (recursively).
-        val targetFolder = job.targetFolder.trim('/')
-        val existing: List<String> = runCatching {
-            val branchInfo = repo.api.branch(job.owner, job.repo, job.branch)
-            val parent = repo.api.commitDetail(job.owner, job.repo, branchInfo.commit.sha)
-            val ft = repo.api.gitTree(job.owner, job.repo, parent.commit.tree.sha, recursive = 1)
-            ft.tree.filter { it.type == "blob" && (targetFolder.isEmpty() || it.path.startsWith("$targetFolder/")) }
-                .map { it.path }
-        }.getOrElse { emptyList() }
+        // Always use JGit for REPLACE_FOLDER to avoid API 422 errors
+        runReplaceFolderWithJGit(job)
+    }
 
-        val newPaths = job.files.map { it.targetPath.trim('/') }.toSet()
-        val toDelete = existing.filterNot { it in newPaths }
+    private suspend fun runReplaceFolderWithJGit(job: UploadJob) = withContext(Dispatchers.IO) {
+        try {
+            val repoUrl = "https://github.com/${job.owner}/${job.repo}.git"
+            val localPath = jgit.localPath(job.owner, job.repo)
 
-        // 2. Build commitFiles list (deletes + adds). Use ByteArray? = null for deletes.
-        val ops = mutableListOf<Pair<String, ByteArray?>>()
-        for (path in toDelete) ops += path to null
-        for (uf in job.files) {
-            try {
-                val bytes = readUri(Uri.parse(uf.id)) ?: throw IllegalStateException("Cannot read")
-                ops += uf.targetPath to bytes
-                uf.state = UploadFileState.DONE
-                uf.bytesDone = uf.sizeBytes
-            } catch (t: Throwable) {
-                uf.state = UploadFileState.FAILED
-                uf.error = t.message
-                Logger.e("Upload", "FAIL read ${uf.targetPath}", t)
+            // Clone if not exists
+            if (!localPath.exists()) {
+                jgit.clone(job.owner, job.repo, repoUrl, shallow = true)
             }
+
+            // Checkout branch
+            jgit.checkout(job.owner, job.repo, job.branch, createIfMissing = true)
+
+            // Pull latest
+            runCatching { jgit.pull(job.owner, job.repo) }
+
+            // List existing files under target folder
+            val targetFolder = job.targetFolder.trim('/')
+            val existing: List<String> = runCatching {
+                val branchInfo = repo.api.branch(job.owner, job.repo, job.branch)
+                val parent = repo.api.commitDetail(job.owner, job.repo, branchInfo.commit.sha)
+                val ft = repo.api.gitTree(job.owner, job.repo, parent.commit.tree.sha, recursive = 1)
+                ft.tree.filter { it.type == "blob" && (targetFolder.isEmpty() || it.path.startsWith("$targetFolder/")) }
+                    .map { it.path }
+            }.getOrElse { emptyList() }
+
+            val newPaths = job.files.map { it.targetPath.trim('/') }.toSet()
+            val toDelete = existing.filterNot { it in newPaths }
+
+            // Delete existing files locally
+            for (path in toDelete) {
+                val file = File(localPath, path)
+                if (file.exists()) file.delete()
+            }
+
+            // Copy new files
+            for (uf in job.files) {
+                try {
+                    val destFile = File(localPath, uf.targetPath)
+                    destFile.parentFile?.mkdirs()
+                    context.contentResolver.openInputStream(Uri.parse(uf.id))?.use { input ->
+                        FileOutputStream(destFile).use { output ->
+                            input.copyTo(output)
+                        }
+                    } ?: throw IllegalStateException("Cannot read file")
+                    uf.state = UploadFileState.DONE
+                    uf.bytesDone = uf.sizeBytes
+                } catch (t: Throwable) {
+                    uf.state = UploadFileState.FAILED
+                    uf.error = t.message
+                    Logger.e("Upload", "FAIL copy ${uf.targetPath}", t)
+                }
+            }
+
+            // Stage all changes
+            jgit.stage(job.owner, job.repo, (toDelete + job.files.map { it.targetPath }).toList())
+
+            // Commit
+            jgit.commit(job.owner, job.repo, job.message, job.authorName, job.authorEmail)
+
+            // Push
+            jgit.push(job.owner, job.repo)
+
+            Logger.i("Upload", "REPLACE_FOLDER JGit committed: deleted=${toDelete.size} added=${job.files.size}")
+        } catch (t: Throwable) {
+            // Clean up on error
+            runCatching { jgit.cleanup(job.owner, job.repo) }
+            throw t
+        } finally {
+            // Always clean up local repo to free storage
+            runCatching { jgit.cleanup(job.owner, job.repo) }
         }
-        // 3. Single atomic commit.
-        repo.commitFiles(job.owner, job.repo, job.branch, ops, job.message, job.authorName, job.authorEmail)
-        Logger.i("Upload", "REPLACE_FOLDER committed: deleted=${toDelete.size} added=${job.files.size}")
     }
 
     private fun joinPath(base: String, name: String): String {
         val b = base.trim('/')
         val n = name.trim('/')
         return if (b.isEmpty()) n else "$b/$n"
+    }
+
+    private suspend fun uploadWithJGit(job: UploadJob, uf: UploadFile) = withContext(Dispatchers.IO) {
+        try {
+            val repoUrl = "https://github.com/${job.owner}/${job.repo}.git"
+            val localPath = jgit.localPath(job.owner, job.repo)
+
+            // Clone if not exists
+            if (!localPath.exists()) {
+                jgit.clone(job.owner, job.repo, repoUrl, shallow = true)
+            }
+
+            // Checkout branch
+            jgit.checkout(job.owner, job.repo, job.branch, createIfMissing = true)
+
+            // Pull latest
+            runCatching { jgit.pull(job.owner, job.repo) }
+
+            // Copy file without loading into memory
+            val destFile = File(localPath, uf.targetPath)
+            destFile.parentFile?.mkdirs()
+
+            context.contentResolver.openInputStream(Uri.parse(uf.id))?.use { input ->
+                FileOutputStream(destFile).use { output ->
+                    input.copyTo(output)
+                }
+            } ?: throw IllegalStateException("Cannot read file")
+
+            // Stage
+            jgit.stage(job.owner, job.repo, listOf(uf.targetPath))
+
+            // Commit
+            jgit.commit(job.owner, job.repo, job.message, job.authorName, job.authorEmail)
+
+            // Push
+            jgit.push(job.owner, job.repo)
+        } catch (t: Throwable) {
+            // Clean up on error
+            runCatching { jgit.cleanup(job.owner, job.repo) }
+            throw t
+        } finally {
+            // Always clean up local repo to free storage
+            runCatching { jgit.cleanup(job.owner, job.repo) }
+        }
+    } catch (t: Throwable) {
+        // Clean up on error
+        runCatching { jgit.cleanup(job.owner, job.repo) }
+        throw t
+    } finally {
+        // Always clean up local repo to free storage
+        runCatching { jgit.cleanup(job.owner, job.repo) }
     }
 }

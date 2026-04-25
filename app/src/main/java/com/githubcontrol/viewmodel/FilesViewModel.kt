@@ -6,6 +6,7 @@ import com.githubcontrol.data.api.DeleteFileRequest
 import com.githubcontrol.data.api.GhBranch
 import com.githubcontrol.data.api.GhContent
 import com.githubcontrol.data.api.PutFileRequest
+import com.githubcontrol.data.git.JGitService
 import com.githubcontrol.data.repository.GitHubRepository
 import com.githubcontrol.utils.fromBase64
 import com.githubcontrol.utils.toBase64
@@ -29,7 +30,10 @@ data class FilesState(
 )
 
 @HiltViewModel
-class FilesViewModel @Inject constructor(private val repo: GitHubRepository) : ViewModel() {
+class FilesViewModel @Inject constructor(
+    private val repo: GitHubRepository,
+    private val jgit: JGitService
+) : ViewModel() {
     private val _state = MutableStateFlow(FilesState())
     val state: StateFlow<FilesState> = _state
 
@@ -104,27 +108,80 @@ class FilesViewModel @Inject constructor(private val repo: GitHubRepository) : V
         viewModelScope.launch {
             try {
                 // Expand any folders so directory selection wipes their full subtree
-                // in a single atomic Git Data API commit.
                 val paths = expandPaths(s.owner, s.name, s.ref, selectedItems)
-                val ops: List<Pair<String, ByteArray?>> = paths.map { it to null }
-                repo.commitFiles(s.owner, s.name, s.ref.ifBlank { "HEAD" }, ops, message, null, null)
+                if (paths.size == 1) {
+                    // Single file: use API
+                    val item = selectedItems.first()
+                    repo.api.deleteFile(s.owner, s.name, item.path, DeleteFileRequest(message, item.sha, s.ref.ifBlank { null }))
+                } else {
+                    // Multiple files/folders: use JGit to avoid API 422
+                    val repoUrl = "https://github.com/${s.owner}/${s.name}.git"
+                    val localPath = jgit.localPath(s.owner, s.name)
+
+                    // Clone if not exists
+                    if (!localPath.exists()) {
+                        jgit.clone(s.owner, s.name, repoUrl, shallow = true)
+                    }
+
+                    // Checkout branch
+                    val branchName = s.ref.ifBlank { "main" }
+                    jgit.checkout(s.owner, s.name, branchName, createIfMissing = true)
+
+                    // Pull latest
+                    runCatching { jgit.pull(s.owner, s.name) }
+
+                    // Delete files locally
+                    for (path in paths) {
+                        val file = java.io.File(localPath, path)
+                        if (file.exists()) file.delete()
+                    }
+
+                    // Stage deletions
+                    jgit.stage(s.owner, s.name, paths)
+
+                    // Commit
+                    jgit.commit(s.owner, s.name, message, null, null)
+
+                    // Push
+                    jgit.push(s.owner, s.name)
+                }
                 clearSelection()
                 load(s.owner, s.name, s.path, s.ref); onDone()
-            } catch (t: Throwable) { _state.value = _state.value.copy(error = t.message) }
+            } catch (t: Throwable) {
+                // Clean up on error too
+                runCatching { jgit.cleanup(s.owner, s.name) }
+                _state.value = _state.value.copy(error = t.message)
+            } finally {
+                // Always clean up local repo to free storage
+                runCatching { jgit.cleanup(s.owner, s.name) }
+            }
         }
     }
 
     /**
      * Delete a folder and everything inside it as one atomic commit.
-     * GitHub has no "delete folder" REST endpoint — we have to enumerate the
-     * folder via the Git Tree API and emit a tree commit that removes every
-     * blob under that path.
+     * Uses JGit to avoid API 422 errors when deleting many files.
      */
     fun deleteFolder(folderPath: String, message: String, onDone: () -> Unit) {
         val s = _state.value
         viewModelScope.launch {
             try {
-                val branchName = s.ref.ifBlank { "HEAD" }
+                val repoUrl = "https://github.com/${s.owner}/${s.name}.git"
+                val localPath = jgit.localPath(s.owner, s.name)
+
+                // Clone if not exists
+                if (!localPath.exists()) {
+                    jgit.clone(s.owner, s.name, repoUrl, shallow = true)
+                }
+
+                // Checkout branch
+                val branchName = s.ref.ifBlank { "main" }
+                jgit.checkout(s.owner, s.name, branchName, createIfMissing = true)
+
+                // Pull latest
+                runCatching { jgit.pull(s.owner, s.name) }
+
+                // List all files under the folder
                 val branchInfo = repo.api.branch(s.owner, s.name, branchName)
                 val parent = repo.api.commitDetail(s.owner, s.name, branchInfo.commit.sha)
                 val ft = repo.api.gitTree(s.owner, s.name, parent.commit.tree.sha, recursive = 1)
@@ -132,14 +189,36 @@ class FilesViewModel @Inject constructor(private val repo: GitHubRepository) : V
                 val toDelete = ft.tree
                     .filter { it.type == "blob" && it.path.startsWith(prefix) }
                     .map { it.path }
+
                 if (toDelete.isEmpty()) {
                     _state.value = _state.value.copy(error = "Folder is empty or already deleted")
                     onDone(); return@launch
                 }
-                val ops: List<Pair<String, ByteArray?>> = toDelete.map { it to null }
-                repo.commitFiles(s.owner, s.name, branchName, ops, message, null, null)
+
+                // Delete files locally
+                for (path in toDelete) {
+                    val file = java.io.File(localPath, path)
+                    if (file.exists()) file.delete()
+                }
+
+                // Stage deletions
+                jgit.stage(s.owner, s.name, toDelete)
+
+                // Commit
+                jgit.commit(s.owner, s.name, message, null, null)
+
+                // Push
+                jgit.push(s.owner, s.name)
+
                 load(s.owner, s.name, s.path, s.ref); onDone()
-            } catch (t: Throwable) { _state.value = _state.value.copy(error = t.message) }
+            } catch (t: Throwable) {
+                // Clean up on error too
+                runCatching { jgit.cleanup(s.owner, s.name) }
+                _state.value = _state.value.copy(error = t.message)
+            } finally {
+                // Always clean up local repo to free storage
+                runCatching { jgit.cleanup(s.owner, s.name) }
+            }
         }
     }
 
